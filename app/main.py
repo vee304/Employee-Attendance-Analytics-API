@@ -9,13 +9,14 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from pymongo import MongoClient
+
 
 load_dotenv()
 
@@ -50,14 +51,22 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r'^EMP\d{4,6}$')                                       
+    name: str = Field(min_length=1, max_length=100)                           # set the min and max length 
+    email: str = Field(max_length=120, pattern='^[^@\s]+@[^@\s]+\.[^@\s]+$')  # set the max length and pattern for email
+    department: str = Field(min_length= 1, max_length=50)                     # set the min and max lenght
+    shift_start: str = Field(..., pattern='^([01]\d|2[0-3]):[0-5]\d$', default='09:30', description="24-hour HH:MM, IST.")
+    shift_end: date = Field(pattern='^([01]\d|2[0-3]):[0-5]\d$', default='18:30', description="24-hour HH:MM, IST. <= shift_start means an overnight shift.")
+    joined_on: date = Field(description="First day of employment, YYYY-MM-DD.")      # date format is still left
+
+    ## because we need to make sure shift_end and shift_start has to differ
+    @model_validator(mode="after")
+    def check_validiti(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("The shift start and end value has to differ")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -69,17 +78,18 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
 @app.post("/employees", status_code=201)
-def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
+def create_employee(body: EmployeeIn):                     #EmployeeIn is the Model class
+    if db.employees.find_one({"emp_code": body.emp_code}):     # this one not needed as 
         raise HTTPException(409, "emp_code already exists")
-    doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc = body.model_dump(mode="json")                                  # Argument -> model_dump(mode="json")
+    doc["created_at"] = datetime.now()      
     db.employees.insert_one(doc)
     doc.pop("_id", None)
     return doc
