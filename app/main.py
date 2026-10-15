@@ -9,13 +9,15 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from fastapi import FastAPI, HTTPException, Path, Query
+from pydantic import BaseModel, Field, model_validator, StrictInt
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 
 load_dotenv()
@@ -25,15 +27,41 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+PresenseStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.employees.create_index("emp_code", unique = True)
+    db.employees.create_index([("department", 1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("emp_code", 1),("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", 11), ("emp_code", 1)])
+    yield
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifesapn = lifespan)
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+
+def from_ms(ms: int) -> datetime:
+    return EPOCH + timedelta(milliseconds=ms)
+
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+
+    local = punch_in.astimezone(IST)
+    if shift_end <= shift_start:                    
+        eh, em = map(int, shift_end.split(":"))
+        if (local.hour, local.minute, local.second) < (eh, em, 0):
+            local -= timedelta(days=1)                
+    return local.date().isoformat()
+
+
+def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
+    d = date.fromisoformat(date_str)
     minutes = int((punch_in - start).total_seconds() / 60)
     return minutes if minutes > 10 else 0
 
@@ -48,17 +76,25 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     return max(0, int((punch_out - end).total_seconds() / 60))
 
 
+# added new helpers
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+def to_ms(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 
 class EmployeeIn(BaseModel):
-    emp_code: str = Field(pattern=r'^EMP\d{4,6}$')                                       
+    emp_code: str = Field(..., pattern=r'^EMP\d{4,6}$')                                      
     name: str = Field(min_length=1, max_length=100)                           # set the min and max length 
-    email: str = Field(max_length=120, pattern='^[^@\s]+@[^@\s]+\.[^@\s]+$')  # set the max length and pattern for email
+    email: str = Field(max_length=120, pattern=r'^[^@\s]+@[^@\s]+\.[^@\s]+$')  # set the max length and pattern for email
     department: str = Field(min_length= 1, max_length=50)                     # set the min and max lenght
-    shift_start: str = Field(..., pattern='^([01]\d|2[0-3]):[0-5]\d$', default='09:30', description="24-hour HH:MM, IST.")
-    shift_end: date = Field(pattern='^([01]\d|2[0-3]):[0-5]\d$', default='18:30', description="24-hour HH:MM, IST. <= shift_start means an overnight shift.")
+    shift_start: str = Field(pattern=r'^([01]\d|2[0-3]):[0-5]\d$', default='09:30', description="24-hour HH:MM, IST.")
+    shift_end: str = Field(pattern=r'^([01]\d|2[0-3]):[0-5]\d$', default='18:30', description="24-hour HH:MM, IST. <= shift_start means an overnight shift.")
     joined_on: date = Field(description="First day of employment, YYYY-MM-DD.")      # date format is still left
 
     ## because we need to make sure shift_end and shift_start has to differ
@@ -96,20 +132,27 @@ def create_employee(body: EmployeeIn):                     #EmployeeIn is the Mo
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
-    q = {}
+def list_employees(department: Optional[str] = None, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+    q = {}                             # it is a MongoDB filter -> {} means "match everything"
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    skip = (page-1)*page_size          # logic for pagination
+    total = db.employees.count_documents(q)
+    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size)) # added sort()
+
+    for e in items:
+        e["created_at"] = to_ms(e["created_at"])
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    
+    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at is not None else datetime.now(timezone.utc)
+    ts = ts.replace(microsecond = 0)
     d = ts.date().isoformat()
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
         raise HTTPException(409, "already punched in for this date")
@@ -137,27 +180,31 @@ def list_attendance(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(1, ge=1, le=100),
 ):
+    if date_from and date_to and date_from > date_to;
+        raise HTTPException(422, "date_form must not be after date_to")
+    
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            q["date"]["$gte"] = date_from.isoformat()
         if date_to:
-            q["date"]["$lte"] = date_to
+            q["date"]["$lte"] = date_to.isoformat()
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip((page-1) * page_size).limit(page_size)
+    )
+    
+    return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
