@@ -10,4 +10,7 @@ Set MONGO_URI and MONGO_DB environment variables.
    - /analytics/employees/{emp_code}/monthly
 
 ## Not implemented
-   - (list here: departments summary, late leaderboard, department trend, admin explain)
+   - GET   /analytics/departments/summary
+   - GET   /analytics/leaderboard/late
+   - GET   /analytics/departments/{department}/trend
+   - GET   /admin/explain/{endpoint}
