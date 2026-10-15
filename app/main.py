@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional, Annotated
+import calendar
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
@@ -37,11 +38,11 @@ async def lifespan(app: FastAPI):
     db.employees.create_index("emp_code", unique = True)
     db.employees.create_index([("department", 1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1),("date", 1)], unique=True)
-    db.attendance_logs.create_index([("date", 11), ("emp_code", 1)])
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
     yield
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifesapn = lifespan)
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan = lifespan)
 
 
 # --------------------------------------------------------------------------- #
